@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.9.37](https://github.com/AlexsJones/llmfit/compare/v0.9.36...v0.9.37) (2026-07-03)
+
+
+### Features
+
+* **calibration:** weekly benchmark refresh + estimate-accuracy audit ([#112](https://github.com/AlexsJones/llmfit/issues/112)/[#119](https://github.com/AlexsJones/llmfit/issues/119)) ([5548723](https://github.com/AlexsJones/llmfit/commit/55487236685fde60a2be09580fe892daeb6a9b8b))
+* **calibration:** weekly benchmark refresh + estimate-accuracy audit against measured data ([6c40dcf](https://github.com/AlexsJones/llmfit/commit/6c40dcf3127ada85a47cb4023c41fee28d33ec3e))
+* **claim:** JSON output for programmatic consumers (llmfit-dra M0) ([f469c22](https://github.com/AlexsJones/llmfit/commit/f469c22cb48cc8e15b33119cd7cf166474ab50a7))
+* **claim:** machine-readable JSON output via the global --json flag ([1636e51](https://github.com/AlexsJones/llmfit/commit/1636e51bb8b452b6c9ab8e47f38e0ac764f25f2f))
+
+
+### Bug Fixes
+
+* **calibration:** exclude speculative-decoding/MTP runs from the accuracy audit ([1c058aa](https://github.com/AlexsJones/llmfit/commit/1c058aa22bd57456487a15aa618155fd1340ef26))
+
 ## [0.9.36](https://github.com/AlexsJones/llmfit/compare/v0.9.35...v0.9.36) (2026-07-03)
 
 
