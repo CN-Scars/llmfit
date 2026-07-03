@@ -991,6 +991,7 @@ mod tests {
             installed: false,
             fits_with_turboquant: false,
             effective_context_length: 8_192,
+            usable_context: 8_192,
         }
     }
 
