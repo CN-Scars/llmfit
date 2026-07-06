@@ -107,6 +107,7 @@ TARGET_MODELS = [
     # Qwen 3.6 (native multimodal + hybrid attention, Apr 2026)
     "Qwen/Qwen3.6-27B",
     "Qwen/Qwen3.6-35B-A3B",
+    "huihui-ai/Huihui-Qwen3.6-35B-A3B-abliterated",
     # Microsoft Phi
     "microsoft/phi-3-mini-4k-instruct",
     "microsoft/Phi-3-medium-14b-instruct",
@@ -219,6 +220,12 @@ TARGET_MODELS = [
     # Liquid AI LFM2 Audio
     "LiquidAI/LFM2-Audio-1.5B",
     "LiquidAI/LFM2.5-Audio-1.5B",
+    # Text-to-speech models
+    "hexgrad/Kokoro-82M",
+    "microsoft/speecht5_tts",
+    "facebook/mms-tts-eng",
+    "suno/bark",
+    "coqui/XTTS-v2",
     # Liquid AI Liquid Nanos (task-specific fine-tunes)
     "LiquidAI/LFM2-1.2B-Tool",
     "LiquidAI/LFM2-1.2B-RAG",
@@ -240,9 +247,9 @@ TARGET_MODELS = [
     "zai-org/GLM-5",
     # Moonshot Kimi K2.5
     "moonshotai/Kimi-K2.5",
-    # MiniMax M2.7 / M2.5
+    # MiniMax M3 / M2.7
+    "MiniMaxAI/MiniMax-M3",
     "MiniMaxAI/MiniMax-M2.7",
-    "MiniMaxAI/MiniMax-M2.5",
     # Xiaomi MiMo
     "XiaomiMiMo/MiMo-V2-Flash",
     "XiaomiMiMo/MiMo-7B-RL",
@@ -270,6 +277,10 @@ TARGET_MODELS = [
     "shoumenchougou/RWKV7-G1f-2.9B-GGUF",
     "shoumenchougou/RWKV7-G1f-7.2B-GGUF",
     "shoumenchougou/RWKV7-G1f-13.3B-GGUF",
+    # NCAI VAETKI
+    "nc-ai-consortium/VAETKI-7B-A1B",
+    "nc-ai-consortium/VAETKI-20B-A2B",
+    "nc-ai-consortium/VAETKI-VL-7B-A1B",
 ]
 
 # Bytes-per-parameter for different quantization levels
@@ -332,19 +343,23 @@ MOE_ACTIVE_PARAMS = {
     "Qwen/Qwen3.5-122B-A10B": 10_000_000_000,
     "Qwen/Qwen3.5-397B-A17B": 17_000_000_000,
     "Qwen/Qwen3.6-35B-A3B": 3_000_000_000,
+    "huihui-ai/Huihui-Qwen3.6-35B-A3B-abliterated": 3_000_000_000,  # Qwen3.6-35B-A3B finetune
     "meta-llama/Llama-4-Scout-17B-16E-Instruct": 17_000_000_000,
     "meta-llama/Llama-4-Maverick-17B-128E-Instruct": 17_000_000_000,
     "xai-org/grok-1": 86_000_000_000,
     "moonshotai/Kimi-K2-Instruct": 32_000_000_000,
     "moonshotai/Kimi-K2.5": 32_000_000_000,
     "zai-org/GLM-5": 40_000_000_000,
+    "MiniMaxAI/MiniMax-M3": 10_000_000_000,
     "MiniMaxAI/MiniMax-M2.7": 10_000_000_000,
-    "MiniMaxAI/MiniMax-M2.5": 10_000_000_000,
     "XiaomiMiMo/MiMo-V2-Flash": 15_000_000_000,
     "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16": 3_000_000_000,
     "LiquidAI/LFM2-8B-A1B": 1_500_000_000,
     "LiquidAI/LFM2-24B-A2B": 2_300_000_000,  # 23.8B total, 2.3B active
     "google/gemma-4-26B-A4B-it": 4_000_000_000,
+    "nc-ai-consortium/VAETKI-7B-A1B": 1_200_000_000,
+    "nc-ai-consortium/VAETKI-20B-A2B": 2_200_000_000,
+    "nc-ai-consortium/VAETKI-VL-7B-A1B": 1_200_000_000,
 }
 
 
@@ -365,6 +380,37 @@ def fetch_model_info(repo_id: str) -> dict | None:
     except Exception as e:
         print(f"  ⚠ Error fetching {repo_id}: {e}", file=sys.stderr)
         return None
+
+
+def extract_license(info: dict | None) -> str | None:
+    """Extract normalized license metadata from HuggingFace model info."""
+    if not info:
+        return None
+
+    card_data = info.get("cardData") or {}
+    license_value = card_data.get("license")
+    license_name = card_data.get("license_name")
+
+    if isinstance(license_name, str) and license_name.strip():
+        license_name = license_name.strip().lower()
+    else:
+        license_name = None
+
+    if isinstance(license_value, str) and license_value.strip():
+        license_value = license_value.strip().lower()
+        return license_name if license_value == "other" and license_name else license_value
+    if isinstance(license_value, list):
+        licenses = [str(item).strip().lower() for item in license_value if str(item).strip()]
+        if licenses:
+            return ",".join(licenses)
+
+    for tag in info.get("tags", []):
+        if isinstance(tag, str) and tag.startswith("license:"):
+            license_tag = tag.removeprefix("license:").strip().lower()
+            if license_tag:
+                return license_name if license_tag == "other" and license_name else license_tag
+
+    return None
 
 
 def format_param_count(total_params: int) -> str:
@@ -590,12 +636,16 @@ def estimate_params_from_arch(config: dict | None) -> int | None:
 def infer_use_case(repo_id: str, pipeline_tag: str | None, config: dict | None) -> str:
     """Infer a brief use-case description from model metadata."""
     rid = repo_id.lower()
+    if pipeline_tag == "text-to-speech":
+        return "Text-to-speech"
     if "embed" in rid or "bge" in rid:
         return "Text embeddings for RAG"
     if "coder" in rid or "starcoder" in rid or "code" in rid:
         return "Code generation and completion"
     if "r1" in rid or "reason" in rid:
         return "Advanced reasoning, chain-of-thought"
+    if pipeline_tag in ("image-text-to-text", "any-to-any") or "-vl-" in rid:
+        return "Multimodal, vision and text"
     if "instruct" in rid or "chat" in rid:
         return "Instruction following, chat"
     if "tiny" in rid or "small" in rid or "mini" in rid:
@@ -689,6 +739,7 @@ def extract_provider(repo_id: str) -> str:
         "nousresearch": "NousResearch",  # NEW
         "wizardlmteam": "WizardLM",  # NEW
         "liquidai": "Liquid AI",
+        "nc-ai-consortium": "NCAI",
     }
     return mapping.get(org, org)
 
@@ -698,6 +749,9 @@ def infer_capabilities(repo_id: str, pipeline_tag: str | None, use_case: str) ->
     caps: list[str] = []
     rid = repo_id.lower()
     uc = use_case.lower()
+
+    if pipeline_tag == "text-to-speech":
+        caps.extend(["audio", "tts"])
 
     # Vision
     if (
@@ -730,6 +784,64 @@ def infer_capabilities(repo_id: str, pipeline_tag: str | None, use_case: str) ->
         caps.append("tool_use")
 
     return caps
+
+
+def _looks_like_language_tag(value: str, allow_bare_iso3: bool) -> bool:
+    parts = value.split("-")
+    primary = parts[0]
+    if not primary.isalpha():
+        return False
+    if len(primary) == 3 and not allow_bare_iso3:
+        return False
+    if len(primary) not in (2, 3):
+        return False
+    return all(2 <= len(part) <= 8 and part.isalnum() for part in parts[1:])
+
+
+def _normalize_language(value: object, explicit_field: bool = False) -> str | None:
+    """Return an explicit HF language tag, or None for non-language metadata."""
+    if not isinstance(value, str):
+        return None
+    lang = value.strip().lower().replace("_", "-")
+    prefixed = False
+    for prefix in ("language:", "languages:", "lang:"):
+        if lang.startswith(prefix):
+            lang = lang[len(prefix):]
+            prefixed = True
+            break
+    if _looks_like_language_tag(lang, allow_bare_iso3=prefixed or explicit_field):
+        return lang
+    return None
+
+
+def infer_languages(info: dict | None, config: dict | None) -> list[str]:
+    """Extract explicitly declared language metadata from HF fields."""
+    values: list[object] = []
+    for source in (info or {}, config or {}):
+        for key in ("language", "languages", "language_code", "language_codes"):
+            val = source.get(key)
+            if isinstance(val, list):
+                values.extend((item, True) for item in val)
+            elif val is not None:
+                values.append((val, True))
+    values.extend((tag, False) for tag in (info or {}).get("tags", []))
+
+    # Meta MMS per-language models (facebook/mms-tts-eng, facebook/mms-tts-deu,
+    # ...) declare no language metadata via the API; the target language is
+    # only encoded as an ISO-639-3 suffix in the repo name.
+    repo_id = (info or {}).get("id", "") or (info or {}).get("modelId", "")
+    repo_lower = repo_id.lower()
+    if "/mms-tts-" in repo_lower:
+        suffix = repo_lower.rsplit("mms-tts-", 1)[1]
+        if suffix:
+            values.append((suffix, True))
+
+    languages: list[str] = []
+    for value, explicit_field in values:
+        lang = _normalize_language(value, explicit_field=explicit_field)
+        if lang and lang not in languages:
+            languages.append(lang)
+    return languages
 
 
 def detect_quant_format(repo_id: str, config: dict | None) -> tuple[str, str]:
@@ -835,6 +947,8 @@ def scrape_model(repo_id: str) -> dict | None:
 
     # Detect quantization format from config.json
     model_format, default_quant = detect_quant_format(repo_id, full_config)
+    if pipeline_tag == "text-to-speech":
+        model_format, default_quant = ("safetensors", "F16")
     context_length = infer_context_length(full_config) if full_config else infer_context_length(config)
 
     # Correct parameters_raw when safetensors reports quantized element counts
@@ -857,6 +971,8 @@ def scrape_model(repo_id: str) -> dict | None:
     # absent fields cause the Rust side to fall back to the linear approx.
     arch_meta = extract_arch_metadata(full_config)
 
+    license_name = extract_license(info)
+
     result = {
         "name": repo_id,
         "provider": extract_provider(repo_id),
@@ -870,6 +986,7 @@ def scrape_model(repo_id: str) -> dict | None:
         "context_length": context_length,
         "use_case": use_case_str,
         "capabilities": infer_capabilities(repo_id, pipeline_tag, use_case_str),
+        "languages": infer_languages(info, full_config or config),
         "pipeline_tag": pipeline_tag or "unknown",
         "architecture": architecture,
         "hf_downloads": info.get("downloads", 0),
@@ -877,6 +994,9 @@ def scrape_model(repo_id: str) -> dict | None:
         "release_date": (info.get("createdAt") or "")[:10] or None,
         **arch_meta,
     }
+
+    if license_name:
+        result["license"] = license_name
 
     # Add MoE fields if detected
     if moe_info["is_moe"]:
@@ -1100,7 +1220,10 @@ DISCOVER_PIPELINES = [
     "text2text-generation",
     "image-text-to-text",
     "feature-extraction",       # Embedding models (useful for RAG sizing)
+    "text-to-speech",
 ]
+
+PRIMARY_DISCOVER_PIPELINE = "text-generation"
 
 # Orgs to skip — test fixtures and legacy mirrors only.
 # Quantization/repack orgs (TheBloke, bartowski, unsloth, etc.) are kept
@@ -1145,7 +1268,8 @@ def _build_first_page_url(pipeline: str, sort: str, page_size: int) -> str:
         f"direction=-1&"
         f"limit={page_size}&"
         f"expand[]=safetensors&"
-        f"expand[]=config"
+        f"expand[]=config&"
+        f"expand[]=cardData"
     )
 
 
@@ -1180,9 +1304,11 @@ def _estimate_params_from_config(config: dict) -> int | None:
 
 def _process_listing(
     m: dict,
+    pipeline: str,
     curated: set[str],
     seen_ids: set[str],
     min_downloads: int,
+    require_downloads_floor: bool,
     stats: dict,
 ) -> dict | None:
     """Check a single model listing against filters.
@@ -1209,8 +1335,9 @@ def _process_listing(
         stats["skip_org"] += 1
         return None
 
-    downloads = m.get("downloads", 0)
-    if downloads < min_downloads:
+    downloads_raw = m.get("downloads")
+    downloads = downloads_raw or 0
+    if downloads < min_downloads and (require_downloads_floor or downloads_raw is not None):
         stats["skip_downloads"] += 1
         return None
 
@@ -1248,6 +1375,7 @@ def _process_listing(
         stats["params_from_config"] += 1
 
     m["_total_params"] = total_params
+    m["_pipeline_tag"] = m.get("pipeline_tag") or pipeline
     stats["accepted"] += 1
     return m
 
@@ -1269,6 +1397,19 @@ def discover_trending_models(limit: int = 30, min_downloads: int = 10000) -> lis
     curated = set(TARGET_MODELS)
     discovered = []
     seen_ids = set()
+
+    # Keep --discover-limit as the mainstream LLM discovery budget. Other
+    # pipelines are additive so TTS/audio discovery does not take slots away
+    # from text-generation coverage.
+    side_quota = max(1, limit // len(DISCOVER_PIPELINES))
+    pipeline_limits = {
+        pipeline: limit if pipeline == PRIMARY_DISCOVER_PIPELINE else side_quota
+        for pipeline in DISCOVER_PIPELINES
+    }
+    pipeline_counts = {pipeline: 0 for pipeline in DISCOVER_PIPELINES}
+
+    def _quotas_full() -> bool:
+        return all(pipeline_counts[p] >= pipeline_limits[p] for p in DISCOVER_PIPELINES)
 
     PAGE_SIZE = 1000
 
@@ -1296,6 +1437,9 @@ def discover_trending_models(limit: int = 30, min_downloads: int = 10000) -> lis
         max_pages = 50 if sort_strategy == "downloads" else 5
 
         for pipeline in DISCOVER_PIPELINES:
+            if pipeline_counts[pipeline] >= pipeline_limits[pipeline]:
+                continue
+
             next_url: str | None = _build_first_page_url(
                 pipeline, sort_strategy, PAGE_SIZE
             )
@@ -1303,7 +1447,8 @@ def discover_trending_models(limit: int = 30, min_downloads: int = 10000) -> lis
             hit_floor = False
             page_num = 0
 
-            while len(discovered) < limit and next_url and page_num < max_pages:
+            while (pipeline_counts[pipeline] < pipeline_limits[pipeline]
+                   and next_url and page_num < max_pages):
                 page_num += 1
                 try:
                     models, next_url = _fetch_models_page(next_url)
@@ -1319,22 +1464,30 @@ def discover_trending_models(limit: int = 30, min_downloads: int = 10000) -> lis
 
                 for m in models:
                     result = _process_listing(
-                        m, curated, seen_ids, effective_min, stats
+                        m,
+                        pipeline,
+                        curated,
+                        seen_ids,
+                        effective_min,
+                        sort_strategy == "downloads",
+                        stats,
                     )
                     if result is None:
                         # Track download-floor hits for early stop
-                        downloads = m.get("downloads", 0)
+                        downloads = m.get("downloads")
                         repo_id = m.get("id", "")
                         if (repo_id and "/" in repo_id
                                 and repo_id not in curated
+                                and downloads is not None
                                 and downloads < effective_min):
                             below_min_this_page += 1
                         continue
 
                     discovered.append(result)
+                    pipeline_counts[pipeline] += 1
                     pipeline_accepted += 1
                     strategy_accepted += 1
-                    if len(discovered) >= limit:
+                    if pipeline_counts[pipeline] >= pipeline_limits[pipeline]:
                         break
 
                 # For download-sorted queries, stop when most results are
@@ -1355,13 +1508,13 @@ def discover_trending_models(limit: int = 30, min_downloads: int = 10000) -> lis
                 print(f"    {pipeline}: +{pipeline_accepted}"
                       f" (pages: {page_num}{suffix})")
 
-            if len(discovered) >= limit:
+            if _quotas_full():
                 break
 
         print(f"  sort={sort_strategy} (min_dl={effective_min:,}): "
               f"+{strategy_accepted} new models")
 
-        if len(discovered) >= limit:
+        if _quotas_full():
             break
 
     # Print filter statistics
@@ -1376,24 +1529,37 @@ def discover_trending_models(limit: int = 30, min_downloads: int = 10000) -> lis
     print(f"    Params from safetensors: {stats['params_from_safetensors']:>6}")
     print(f"    Params from config est.: {stats['params_from_config']:>6}")
     print(f"    Accepted:                {stats['accepted']:>6}")
+    print(f"    Pipeline quotas:         {pipeline_limits}")
 
-    return discovered[:limit]
+    return discovered
 
 
 def _build_discovered_model(listing: dict) -> dict | None:
     """Build model dict from a listing returned by discover_trending_models.
 
     Only fetches config.json for accurate context length; all other metadata
-    comes from the listing data already obtained via expand=safetensors.
+    comes from the listing data already obtained via expand fields.
     """
     repo_id = listing["id"]
     total_params = listing["_total_params"]
     config = listing.get("config", {})
-    pipeline_tag = listing.get("pipeline_tag")
+    pipeline_tag = listing.get("pipeline_tag") or listing.get("_pipeline_tag")
+
+    # Listings from non-download sort strategies (trending, likes) omit
+    # downloads/likes/tags, which would zero out popularity metadata and
+    # lose language tags. Backfill those fields with a full info fetch.
+    if listing.get("downloads") is None or listing.get("likes") is None:
+        info = fetch_model_info(repo_id)
+        if info:
+            for key in ("downloads", "likes", "createdAt", "tags"):
+                if listing.get(key) is None and info.get(key) is not None:
+                    listing[key] = info[key]
 
     full_config = fetch_config_json(repo_id)
 
     model_format, default_quant = detect_quant_format(repo_id, full_config)
+    if pipeline_tag == "text-to-speech":
+        model_format, default_quant = ("safetensors", "F16")
     context_length = (infer_context_length(full_config) if full_config
                       else infer_context_length(config))
 
@@ -1412,6 +1578,8 @@ def _build_discovered_model(listing: dict) -> dict | None:
     # Architecture metadata for the precise KV cache formula.
     arch_meta = extract_arch_metadata(full_config)
 
+    license_name = extract_license(listing)
+
     model = {
         "name": repo_id,
         "provider": extract_provider(repo_id),
@@ -1425,6 +1593,7 @@ def _build_discovered_model(listing: dict) -> dict | None:
         "context_length": context_length,
         "use_case": use_case_str,
         "capabilities": infer_capabilities(repo_id, pipeline_tag, use_case_str),
+        "languages": infer_languages(listing, full_config or config),
         "pipeline_tag": pipeline_tag or "unknown",
         "architecture": architecture,
         "hf_downloads": listing.get("downloads", 0),
@@ -1433,6 +1602,9 @@ def _build_discovered_model(listing: dict) -> dict | None:
         **arch_meta,
         "_discovered": True,
     }
+
+    if license_name:
+        model["license"] = license_name
 
     if moe_info["is_moe"]:
         model["is_moe"] = True
@@ -1981,28 +2153,28 @@ def main():
             "hf_downloads": 0, "hf_likes": 0, "release_date": "2026-01-26",
         },
         {
+            "name": "MiniMaxAI/MiniMax-M3",
+            "provider": "MiniMax", "parameter_count": "230B",
+            "parameters_raw": 230000000000,
+            "min_ram_gb": 128.6, "recommended_ram_gb": 214.4, "min_vram_gb": 117.9,
+            "quantization": "Q4_K_M", "context_length": 524288,
+            "use_case": "Latest flagship: 512K context, 128K max output, image input",
+            "pipeline_tag": "text-generation", "architecture": "minimax",
+            "is_moe": True, "num_experts": 32, "active_experts": 2,
+            "active_parameters": 10000000000,
+            "hf_downloads": 0, "hf_likes": 0, "release_date": "2026-06-03",
+        },
+        {
             "name": "MiniMaxAI/MiniMax-M2.7",
             "provider": "MiniMax", "parameter_count": "230B",
             "parameters_raw": 230000000000,
             "min_ram_gb": 128.6, "recommended_ram_gb": 214.4, "min_vram_gb": 117.9,
             "quantization": "Q4_K_M", "context_length": 131072,
-            "use_case": "Latest flagship with enhanced reasoning and coding",
+            "use_case": "Previous flagship with enhanced reasoning and coding",
             "pipeline_tag": "text-generation", "architecture": "minimax",
             "is_moe": True, "num_experts": 32, "active_experts": 2,
             "active_parameters": 10000000000,
             "hf_downloads": 0, "hf_likes": 0, "release_date": "2026-03-18",
-        },
-        {
-            "name": "MiniMaxAI/MiniMax-M2.5",
-            "provider": "MiniMax", "parameter_count": "230B",
-            "parameters_raw": 230000000000,
-            "min_ram_gb": 128.6, "recommended_ram_gb": 214.4, "min_vram_gb": 117.9,
-            "quantization": "Q4_K_M", "context_length": 131072,
-            "use_case": "Coding, agentic tool use",
-            "pipeline_tag": "text-generation", "architecture": "minimax",
-            "is_moe": True, "num_experts": 32, "active_experts": 2,
-            "active_parameters": 10000000000,
-            "hf_downloads": 0, "hf_likes": 0, "release_date": "2026-02-11",
         },
         {
             "name": "XiaomiMiMo/MiMo-V2-Flash",
@@ -2500,6 +2672,39 @@ def main():
             "pipeline_tag": "text-generation", "architecture": "lfm2",
             "hf_downloads": 0, "hf_likes": 0, "release_date": "2025-11-28",
         },
+        {
+            "name": "hexgrad/Kokoro-82M",
+            "provider": "hexgrad", "parameter_count": "82M",
+            "parameters_raw": 82_000_000,
+            "min_ram_gb": 1.0, "recommended_ram_gb": 2.0, "min_vram_gb": 0.5,
+            "quantization": "F16", "format": "safetensors", "context_length": 4096,
+            "use_case": "Text-to-speech",
+            "capabilities": ["audio", "tts"], "languages": [],
+            "pipeline_tag": "text-to-speech", "architecture": "unknown",
+            "hf_downloads": 0, "hf_likes": 0, "release_date": None,
+        },
+        {
+            "name": "microsoft/speecht5_tts",
+            "provider": "Microsoft", "parameter_count": "144M",
+            "parameters_raw": 144_000_000,
+            "min_ram_gb": 1.0, "recommended_ram_gb": 2.0, "min_vram_gb": 0.5,
+            "quantization": "F16", "format": "safetensors", "context_length": 4096,
+            "use_case": "Text-to-speech",
+            "capabilities": ["audio", "tts"], "languages": [],
+            "pipeline_tag": "text-to-speech", "architecture": "speecht5",
+            "hf_downloads": 0, "hf_likes": 0, "release_date": None,
+        },
+        {
+            "name": "facebook/mms-tts-eng",
+            "provider": "Meta", "parameter_count": "36M",
+            "parameters_raw": 36_000_000,
+            "min_ram_gb": 1.0, "recommended_ram_gb": 2.0, "min_vram_gb": 0.5,
+            "quantization": "F16", "format": "safetensors", "context_length": 4096,
+            "use_case": "Text-to-speech",
+            "capabilities": ["audio", "tts"], "languages": [],
+            "pipeline_tag": "text-to-speech", "architecture": "vits",
+            "hf_downloads": 0, "hf_likes": 0, "release_date": None,
+        },
         # RWKV v7 G1f: GGUF-native repos — no safetensors metadata, fallback required
         {
             "name": "shoumenchougou/RWKV7-G1f-1.5B-GGUF",
@@ -2608,7 +2813,7 @@ def main():
     # The database is additive: models from previous runs are preserved.
     # Freshly scraped models update existing entries; historical models
     # that are no longer in the top discovered set are kept as-is.
-    output_paths = ["data/hf_models.json", "llmfit-core/data/hf_models.json"]
+    output_paths = ["llmfit-core/data/hf_models.json"]
 
     # Build a map of freshly scraped models (name -> model dict)
     fresh_by_name = {m["name"]: m for m in results}
@@ -2626,6 +2831,17 @@ def main():
                 for old_model in existing:
                     name = old_model.get("name", "")
                     if name in fresh_by_name:
+                        fresh_model = fresh_by_name[name]
+                        if old_model.get("license") and not fresh_model.get("license"):
+                            fresh_model["license"] = old_model["license"]
+                        if old_model.get("gguf_sources") and not fresh_model.get("gguf_sources"):
+                            fresh_model["gguf_sources"] = old_model["gguf_sources"]
+                        # Fallback stubs and trending listings carry no
+                        # popularity/date/language metadata — never let them
+                        # clobber real values from a previous scrape.
+                        for key in ("hf_downloads", "hf_likes", "release_date", "languages"):
+                            if old_model.get(key) and not fresh_model.get(key):
+                                fresh_model[key] = old_model[key]
                         updated_count += 1
                     elif name:
                         # Historical model not in current scrape — keep it
@@ -2641,6 +2857,13 @@ def main():
         print(f"\nMerged with existing database ({existing_count} models):")
         print(f"  Updated: {updated_count}, Retained historical: {retained_count}")
 
+    # Keep additive/retained entries on the current schema even if they were
+    # produced by an older scraper version.
+    for model in results:
+        model.setdefault("capabilities", [])
+        if not model.get("languages"):
+            model.pop("languages", None)
+
     # Sort by parameter count
     results.sort(key=lambda m: m["parameters_raw"])
 
@@ -2651,7 +2874,7 @@ def main():
         gguf_enriched = enrich_gguf_sources(results, threads=args.threads)
         print(f"  Found GGUF sources for {gguf_enriched} models")
 
-    # Write to both locations: repo root (for reference) and llmfit-core (compiled into binary)
+    # Write to llmfit-core/data (compiled into the binary via include_str!)
     for output_path in output_paths:
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         with open(output_path, "w") as f:
@@ -2673,3 +2896,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+    

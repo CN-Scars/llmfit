@@ -111,6 +111,7 @@ pub enum InferenceRuntime {
     LlamaCpp, // llama.cpp / Ollama
     Mlx,      // Apple MLX framework
     Vllm,     // vLLM (for AWQ/GPTQ/AutoRound pre-quantized models)
+    Unsupported,
 }
 
 impl InferenceRuntime {
@@ -119,6 +120,7 @@ impl InferenceRuntime {
             InferenceRuntime::LlamaCpp => "llama.cpp",
             InferenceRuntime::Mlx => "MLX",
             InferenceRuntime::Vllm => "vLLM",
+            InferenceRuntime::Unsupported => "unsupported",
         }
     }
 }
@@ -217,6 +219,11 @@ pub struct ModelFit {
     pub installed: bool,               // model found in a local runtime provider
     pub fits_with_turboquant: bool,    // TooTight at fp16 KV but fits with TurboQuant KV
     pub effective_context_length: u32, // context length used for memory estimation
+    /// Context (tokens) that actually fits in this run mode's memory pool
+    /// after weights and overhead, capped at the model's native window.
+    /// A "Perfect" fit with an 8k usable context out of a 262k window is a
+    /// very different proposition for coding work (issue #621).
+    pub usable_context: u32,
 }
 
 impl ModelFit {
@@ -290,6 +297,38 @@ impl ModelFit {
                 "Context capped at {} tokens for estimation (model supports up to {}; use --max-context to override)",
                 estimation_ctx, model.context_length
             ));
+        }
+
+        if model.requires_specialized_runtime() {
+            notes.push(
+                "Requires a specialized TTS runtime; llama.cpp/MLX/vLLM fit is not supported yet"
+                    .to_string(),
+            );
+            return ModelFit {
+                model: model.clone(),
+                fit_level: FitLevel::TooTight,
+                run_mode: RunMode::CpuOnly,
+                memory_required_gb: default_mem_required,
+                memory_available_gb: 0.0,
+                utilization_pct: 0.0,
+                notes,
+                moe_offloaded_gb: None,
+                score: 0.0,
+                score_components: ScoreComponents {
+                    quality: 0.0,
+                    speed: 0.0,
+                    fit: 0.0,
+                    context: 0.0,
+                },
+                estimated_tps: 0.0,
+                best_quant: model.quantization.clone(),
+                use_case,
+                runtime: InferenceRuntime::Unsupported,
+                installed: false,
+                fits_with_turboquant: false,
+                effective_context_length: estimation_ctx,
+                usable_context: 0,
+            };
         }
 
         // Determine inference runtime up front so path selection can use
@@ -524,6 +563,22 @@ impl ModelFit {
             ));
         }
 
+        // Usable context: how many tokens of KV cache the pool can actually
+        // hold once weights and runtime overhead are resident. The KV formula
+        // is linear in ctx, so derive a per-token cost from a fixed reference
+        // window. Suggested by @MrMarble in issue #621.
+        let usable_context = {
+            const REF_CTX: u32 = 4096;
+            let fixed_mem = model.estimate_memory_gb(&best_quant_str, 0);
+            let leftover = (mem_available - fixed_mem).max(0.0);
+            let per_token_gb = model.kv_cache_gb(REF_CTX, KvQuant::Fp16) / f64::from(REF_CTX);
+            if per_token_gb > 0.0 {
+                ((leftover / per_token_gb) as u32).min(model.context_length)
+            } else {
+                model.context_length
+            }
+        };
+
         // Check if a TooTight model would fit with TurboQuant KV compression.
         // Only compute on CUDA systems — TurboQuant requires vLLM + CUDA.
         let fits_with_turboquant =
@@ -554,7 +609,26 @@ impl ModelFit {
             installed: false, // set later by App after provider detection
             fits_with_turboquant,
             effective_context_length: estimation_ctx,
+            usable_context,
         }
+    }
+
+    /// Context column text: `"262k→14k"` when the memory pool constrains
+    /// context below the model's native window, plain `"262k"` otherwise.
+    /// See [`fmt_ctx_tokens`] for the token formatting.
+    pub fn context_display(&self) -> String {
+        let native = fmt_ctx_tokens(self.model.context_length);
+        if self.usable_context < self.model.context_length {
+            format!("{native}\u{2192}{}", fmt_ctx_tokens(self.usable_context))
+        } else {
+            native
+        }
+    }
+
+    /// True when the usable context is too small for real work (below 4k),
+    /// so UIs can highlight the constraint.
+    pub fn context_severely_limited(&self) -> bool {
+        self.usable_context < 4096 && self.usable_context < self.model.context_length
     }
 
     pub fn fit_emoji(&self) -> &str {
@@ -593,7 +667,8 @@ impl ModelFit {
 /// Pure memory headroom scoring.
 /// - GPU (including Apple Silicon unified memory): can reach Perfect.
 /// - CpuOffload: caps at Good.
-/// - CpuOnly: caps at Marginal -- CPU-only inference is always a compromise.
+/// - CpuOnly: caps at Good -- no GPU acceleration so never Perfect, but a model
+///   that fits with comfortable headroom is genuinely runnable, not Marginal.
 fn score_fit(
     mem_required: f64,
     mem_available: f64,
@@ -632,8 +707,15 @@ fn score_fit(
             }
         }
         RunMode::CpuOnly => {
-            // CPU-only is always a compromise -- cap at Marginal
-            FitLevel::Marginal
+            // CPU-only never reaches Perfect (that requires a GPU), but a model
+            // that fits with comfortable headroom is genuinely runnable -- cap
+            // at Good rather than hiding every CPU-only model behind Marginal.
+            // (Matches the FitLevel::Good contract: "GPU tight, or CPU comfortable".)
+            if mem_available >= mem_required * 1.2 {
+                FitLevel::Good
+            } else {
+                FitLevel::Marginal
+            }
         }
     }
 }
@@ -793,7 +875,9 @@ fn best_quant_for_runtime_budget(
 }
 
 pub fn backend_compatible(model: &LlmModel, system: &SystemSpecs) -> bool {
-    if model.is_mlx_model() {
+    if model.requires_specialized_runtime() {
+        false
+    } else if model.is_mlx_model() {
         system.backend == GpuBackend::Metal && system.unified_memory
     } else if model.is_prequantized() {
         if !matches!(system.backend, GpuBackend::Cuda | GpuBackend::Rocm) {
@@ -878,7 +962,13 @@ pub fn rank_models_by_fit_opts_col(
                 .utilization_pct
                 .partial_cmp(&a.utilization_pct)
                 .unwrap_or(std::cmp::Ordering::Equal),
-            SortColumn::Ctx => b.model.context_length.cmp(&a.model.context_length),
+            // Sort by the context that actually fits on this machine, not the
+            // advertised window — that's the number that constrains real work
+            // (issue #621). Native window breaks ties.
+            SortColumn::Ctx => b
+                .usable_context
+                .cmp(&a.usable_context)
+                .then(b.model.context_length.cmp(&a.model.context_length)),
             SortColumn::ReleaseDate => {
                 let a_date = a.model.release_date.as_deref().unwrap_or("");
                 let b_date = b.model.release_date.as_deref().unwrap_or("");
@@ -1232,6 +1322,7 @@ fn estimate_tps(
     // Used when the GPU is not recognized (custom/unnamed GPUs,
     // synthetic entries from --memory override, etc.).
     let k: f64 = match (system.backend, runtime) {
+        (_, InferenceRuntime::Unsupported) => 0.0,
         (GpuBackend::Metal, InferenceRuntime::Mlx) => 250.0,
         (GpuBackend::Metal, InferenceRuntime::LlamaCpp) => 160.0,
         (GpuBackend::Metal, InferenceRuntime::Vllm) => 160.0,
@@ -1329,18 +1420,27 @@ fn compute_scores(
 fn quality_score(model: &LlmModel, quant: &str, use_case: UseCase) -> f64 {
     let params = model.params_b();
 
-    // Base quality by parameter count
-    let base = if params < 1.0 {
+    // For the base quality tier, MoE models are scored on their *active*
+    // parameters per token rather than the total across all experts. A model
+    // like Qwen3-Coder-Next (80B total / 3B active) infers at a quality closer
+    // to a small dense model, so using the 80B total would inflate its tier.
+    let quality_params = model
+        .active_parameters
+        .map(|a| a as f64 / 1_000_000_000.0)
+        .unwrap_or(params);
+
+    // Base quality by (active) parameter count
+    let base = if quality_params < 1.0 {
         30.0
-    } else if params < 3.0 {
+    } else if quality_params < 3.0 {
         45.0
-    } else if params < 7.0 {
+    } else if quality_params < 7.0 {
         60.0
-    } else if params < 10.0 {
+    } else if quality_params < 10.0 {
         75.0
-    } else if params < 20.0 {
+    } else if quality_params < 20.0 {
         82.0
-    } else if params < 40.0 {
+    } else if quality_params < 40.0 {
         89.0
     } else {
         95.0
@@ -1370,39 +1470,118 @@ fn quality_score(model: &LlmModel, quant: &str, use_case: UseCase) -> f64 {
     // Generation bonus: newer model generations get a quality bump
     let gen_bonus = models::generation_quality_bonus(model.architecture.as_deref(), &model.name);
 
+    // Recency bonus: same-size models improve over time, so a freshly released
+    // model edges out an identically-sized older one. Uses the catalog
+    // `release_date` (YYYY-MM-DD); models without a date get no bonus.
+    let recency_bonus = model
+        .release_date
+        .as_deref()
+        .and_then(|d| months_since(d, current_year_month()))
+        .map(|months| {
+            if months < 3 {
+                3.0
+            } else if months < 9 {
+                1.5
+            } else {
+                0.0
+            }
+        })
+        .unwrap_or(0.0);
+
     // Quantization penalty
     let q_penalty = models::quant_quality_penalty(quant);
 
-    // Task alignment bump
-    let task_bump = match use_case {
-        UseCase::Coding => {
-            if name_lower.contains("code")
-                || name_lower.contains("starcoder")
-                || name_lower.contains("wizard")
+    // Task alignment bump. Curated benchmark aggregates (per-family table in
+    // data/use_case_benchmarks.json) take precedence over name heuristics:
+    // the family's measured task strength, centered on a 72-point baseline,
+    // maps to a bounded adjustment so it composes with the existing quality
+    // machinery instead of replacing it (issue #150). Families without an
+    // entry keep the original heuristics.
+    let bench_task_key = match use_case {
+        UseCase::Coding => Some("coding"),
+        UseCase::Reasoning => Some("reasoning"),
+        UseCase::Chat => Some("chat"),
+        _ => None,
+    };
+    let bench_score = bench_task_key.and_then(|k| crate::task_bench::score(&name_lower, k));
+    let task_bump = match bench_score {
+        Some(bench) => ((bench - 72.0) * 0.4).clamp(-8.0, 9.0),
+        None => match use_case {
+            UseCase::Coding => {
+                if name_lower.contains("code")
+                    || name_lower.contains("starcoder")
+                    || name_lower.contains("wizard")
+                {
+                    6.0
+                } else {
+                    0.0
+                }
+            }
+            UseCase::Reasoning => {
+                if params >= 13.0 {
+                    5.0
+                } else {
+                    0.0
+                }
+            }
+            UseCase::Multimodal
+                if (name_lower.contains("vision")
+                    || model.use_case.to_lowercase().contains("vision")) =>
             {
                 6.0
-            } else {
-                0.0
             }
-        }
-        UseCase::Reasoning => {
-            if params >= 13.0 {
-                5.0
-            } else {
-                0.0
-            }
-        }
-        UseCase::Multimodal => {
-            if name_lower.contains("vision") || model.use_case.to_lowercase().contains("vision") {
-                6.0
-            } else {
-                0.0
-            }
-        }
-        _ => 0.0,
+            _ => 0.0,
+        },
     };
 
-    (base + family_bump + gen_bonus + q_penalty + task_bump).clamp(0.0, 100.0)
+    (base + family_bump + gen_bonus + recency_bonus + q_penalty + task_bump).clamp(0.0, 100.0)
+}
+
+/// Token count as a compact column string: `"32k"` for ≥1000, raw otherwise.
+fn fmt_ctx_tokens(tokens: u32) -> String {
+    if tokens >= 1000 {
+        format!("{}k", tokens / 1000)
+    } else {
+        tokens.to_string()
+    }
+}
+
+/// Whole months elapsed between a `release_date` (`YYYY-MM-DD`, only the year
+/// and month are read) and `now` as a `(year, month)` pair. Returns `None` if
+/// the date can't be parsed; negative spans (future dates) clamp to 0.
+fn months_since(release_date: &str, now: (i32, u32)) -> Option<u32> {
+    let mut parts = release_date.split('-');
+    let year: i32 = parts.next()?.trim().parse().ok()?;
+    let month: i32 = parts.next()?.trim().parse().ok()?;
+    let (now_year, now_month) = now;
+    let diff = (now_year - year) * 12 + (now_month as i32 - month);
+    Some(diff.max(0) as u32)
+}
+
+/// Current `(year, month)` in UTC, derived from the system clock. Falls back to
+/// the Unix epoch if the clock is before 1970 (which only removes the bonus).
+fn current_year_month() -> (i32, u32) {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    civil_from_days((secs / 86_400) as i64)
+}
+
+/// Convert days since 1970-01-01 to `(year, month)` in the proleptic Gregorian
+/// calendar (Howard Hinnant's `civil_from_days`). Exact — no 365-day/30-day
+/// approximations, so the recency bonus doesn't drift across leap years.
+fn civil_from_days(z: i64) -> (i32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let month = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let year = if month <= 2 { y + 1 } else { y };
+    (year as i32, month as u32)
 }
 
 /// Speed score: normalize estimated TPS against target for the use case.
@@ -1421,19 +1600,15 @@ fn fit_score(required: f64, available: f64) -> f64 {
         return 0.0;
     }
     let ratio = required / available;
-    // Sweet spot: 50-80% utilization scores highest
-    if ratio <= 0.5 {
-        // Under-utilizing: still good but not optimal
-        60.0 + (ratio / 0.5) * 40.0
-    } else if ratio <= 0.8 {
-        100.0
-    } else if ratio <= 0.9 {
-        // Getting tight
-        70.0
-    } else {
-        // Very tight
-        50.0
-    }
+    // Headroom is good: anything that fits with room to spare is a perfect fit,
+    // so the score holds a flat 100 up to a comfortable utilization, then eases
+    // down as memory gets tight via a one-sided Gaussian falloff. This removes
+    // the old step function's 100 -> 70 cliff at 80% (79% scored 100, 81%
+    // scored 70) without penalizing models that leave headroom.
+    const COMFORT: f64 = 0.70;
+    const SIGMA: f64 = 0.20;
+    let z = ((ratio - COMFORT) / SIGMA).max(0.0);
+    (100.0 * (-0.5 * z * z).exp()).clamp(0.0, 100.0)
 }
 
 /// Context score: context window capability vs target for the use case.
@@ -1494,6 +1669,7 @@ mod tests {
             release_date: None,
             gguf_sources: vec![],
             capabilities: vec![],
+            languages: vec![],
             format: models::ModelFormat::default(),
             num_attention_heads: None,
             num_key_value_heads: None,
@@ -1569,10 +1745,26 @@ mod tests {
     }
 
     #[test]
-    fn test_score_fit_cpu_caps_at_marginal() {
-        // CPU-only never reaches Perfect
+    fn test_score_fit_cpu_comfortable_is_good() {
+        // CPU-only with comfortable headroom (4 GB of 32 GB) is runnable -> Good.
+        // It never reaches Perfect (recommended 8 GB is met, but Perfect needs a GPU).
         let fit = score_fit(4.0, 32.0, 8.0, RunMode::CpuOnly);
+        assert_eq!(fit, FitLevel::Good);
+    }
+
+    #[test]
+    fn test_score_fit_cpu_tight_is_marginal() {
+        // CPU-only that only just fits (under the 1.2x headroom bar) stays Marginal.
+        let fit = score_fit(8.0, 8.5, 16.0, RunMode::CpuOnly);
         assert_eq!(fit, FitLevel::Marginal);
+    }
+
+    #[test]
+    fn test_score_fit_cpu_never_perfect() {
+        // Even with enormous headroom, CPU-only caps at Good (no GPU -> not Perfect).
+        let fit = score_fit(1.0, 64.0, 2.0, RunMode::CpuOnly);
+        assert_ne!(fit, FitLevel::Perfect);
+        assert_eq!(fit, FitLevel::Good);
     }
 
     #[test]
@@ -1619,8 +1811,10 @@ mod tests {
 
         // Should use CPU path
         assert_eq!(fit.run_mode, RunMode::CpuOnly);
-        // CPU-only caps at Marginal
-        assert_eq!(fit.fit_level, FitLevel::Marginal);
+        // CPU-only with comfortable headroom (7B in 16 GB) is runnable -> Good,
+        // and never Perfect (that requires a GPU).
+        assert_eq!(fit.fit_level, FitLevel::Good);
+        assert_ne!(fit.fit_level, FitLevel::Perfect);
     }
 
     #[test]
@@ -1664,6 +1858,26 @@ mod tests {
     }
 
     #[test]
+    fn test_tts_requires_unsupported_runtime() {
+        let mut model = test_model("82M", 1.0, Some(0.5));
+        model.quantization = "F16".to_string();
+        model.format = models::ModelFormat::Safetensors;
+        model.capabilities = vec![models::Capability::Audio, models::Capability::Tts];
+        let system = test_system(16.0, true, Some(8.0));
+
+        let fit = ModelFit::analyze(&model, &system);
+
+        assert_eq!(fit.runtime, InferenceRuntime::Unsupported);
+        assert_eq!(fit.fit_level, FitLevel::TooTight);
+        assert_eq!(fit.score, 0.0);
+        assert!(
+            fit.notes
+                .iter()
+                .any(|n| n.contains("specialized TTS runtime"))
+        );
+    }
+
+    #[test]
     fn test_moe_offload_tries_lower_quantization() {
         let model = LlmModel {
             name: "MoE Quant Test".to_string(),
@@ -1683,6 +1897,7 @@ mod tests {
             release_date: None,
             gguf_sources: vec![],
             capabilities: vec![],
+            languages: vec![],
             format: models::ModelFormat::default(),
             num_attention_heads: None,
             num_key_value_heads: None,
@@ -1727,6 +1942,7 @@ mod tests {
             release_date: None,
             gguf_sources: vec![],
             capabilities: vec![],
+            languages: vec![],
             format: models::ModelFormat::default(),
             num_attention_heads: None,
             num_key_value_heads: None,
@@ -1830,28 +2046,43 @@ mod tests {
 
     #[test]
     fn test_fit_score_sweet_spot() {
-        // Sweet spot: 50-80% utilization
-        let score = fit_score(6.0, 10.0);
-        assert!(score >= 95.0); // Should be near perfect
+        // Comfortable utilization (room to spare) is a perfect fit.
+        assert!((fit_score(6.5, 10.0) - 100.0).abs() < 0.01); // 65%
+        assert!((fit_score(6.0, 10.0) - 100.0).abs() < 0.01); // 60%
 
-        let score2 = fit_score(8.0, 10.0);
-        assert_eq!(score2, 100.0);
+        // Past the comfort point the smooth curve eases down instead of holding
+        // a flat 100 right up to the old 80% cliff.
+        let score2 = fit_score(8.0, 10.0); // 80%
+        assert!(score2 > 70.0 && score2 < 100.0);
     }
 
     #[test]
     fn test_fit_score_under_utilized() {
-        // Under-utilizing: still good but not optimal
-        let score = fit_score(2.0, 10.0);
-        assert!(score >= 60.0);
-        assert!(score < 100.0);
+        // Plenty of headroom is a good thing, not waste -- it stays a perfect
+        // fit rather than being penalized.
+        assert!((fit_score(2.0, 10.0) - 100.0).abs() < 0.01); // 20%
+        assert!((fit_score(5.0, 10.0) - 100.0).abs() < 0.01); // 50%
     }
 
     #[test]
     fn test_fit_score_tight() {
-        // Very tight fit
-        let score = fit_score(9.5, 10.0);
-        assert!(score >= 50.0);
-        assert!(score < 80.0);
+        // Very tight fit: still positive but well off the peak, and no longer
+        // pinned to the old flat 50 floor.
+        let score = fit_score(9.5, 10.0); // 95% utilization
+        assert!(score > 0.0 && score < 50.0);
+        // Smoothly monotonic as it tightens past the peak.
+        assert!(score < fit_score(8.5, 10.0));
+    }
+
+    #[test]
+    fn test_fit_score_smooth_no_cliffs() {
+        // Across the old 80% step boundary, neighbouring ratios stay close
+        // together instead of jumping 100 -> 70.
+        // Old step: 79% -> 100, 81% -> 70 (a 30-point cliff). The smooth curve
+        // keeps neighbours within a few points of each other.
+        let below = fit_score(7.9, 10.0);
+        let above = fit_score(8.1, 10.0);
+        assert!((below - above).abs() < 8.0);
     }
 
     #[test]
@@ -1978,6 +2209,77 @@ mod tests {
     }
 
     #[test]
+    fn test_quality_score_moe_uses_active_params() {
+        // 80B total / 3B active MoE: the base tier should follow the 3B active
+        // count (45 tier), not the 80B total (95 tier).
+        let mut moe = test_model("80B", 48.0, Some(48.0));
+        moe.active_parameters = Some(3_000_000_000);
+        let moe_score = quality_score(&moe, "Q4_K_M", UseCase::General);
+
+        // A plain 80B dense model (no active_parameters) keeps the top tier.
+        let dense = test_model("80B", 48.0, Some(48.0));
+        let dense_score = quality_score(&dense, "Q4_K_M", UseCase::General);
+
+        assert!(
+            dense_score > moe_score + 30.0,
+            "MoE (active 3B) {} should be far below dense 80B {}",
+            moe_score,
+            dense_score
+        );
+
+        // And it should land near a real 3B dense model's tier.
+        let small = test_model("3B", 2.0, Some(2.0));
+        let small_score = quality_score(&small, "Q4_K_M", UseCase::General);
+        assert!(
+            (moe_score - small_score).abs() < 0.01,
+            "MoE active-3B {} should match dense 3B {}",
+            moe_score,
+            small_score
+        );
+    }
+
+    #[test]
+    fn test_quality_score_recency_bonus() {
+        // Two otherwise-identical models; the newer one scores higher purely on
+        // its release date. months_since/current_year_month back the bonus, so
+        // we exercise the pure helper directly for determinism below.
+        let mut fresh = test_model("7B", 4.0, Some(4.0));
+        fresh.release_date = Some("2099-01-01".to_string()); // far future -> 0 months
+        let mut old = test_model("7B", 4.0, Some(4.0));
+        old.release_date = Some("2000-01-01".to_string()); // ancient -> no bonus
+
+        let fresh_score = quality_score(&fresh, "Q4_K_M", UseCase::General);
+        let old_score = quality_score(&old, "Q4_K_M", UseCase::General);
+        assert!(
+            fresh_score > old_score,
+            "fresh {} should beat old {}",
+            fresh_score,
+            old_score
+        );
+        // Fresh gets the full +3 on top of the no-bonus baseline of 70.
+        assert!((fresh_score - 73.0).abs() < 0.01, "Got {}", fresh_score);
+        assert!((old_score - 70.0).abs() < 0.01, "Got {}", old_score);
+    }
+
+    #[test]
+    fn test_months_since_is_deterministic() {
+        // Pure date math — no dependency on the system clock.
+        assert_eq!(months_since("2026-06-01", (2026, 6)), Some(0));
+        assert_eq!(months_since("2026-04-01", (2026, 6)), Some(2)); // < 3 -> +3
+        assert_eq!(months_since("2025-12-01", (2026, 6)), Some(6)); // < 9 -> +1.5
+        assert_eq!(months_since("2024-06-01", (2026, 6)), Some(24)); // old -> 0
+        assert_eq!(months_since("2099-01-01", (2026, 6)), Some(0)); // future clamps
+        assert_eq!(months_since("not-a-date", (2026, 6)), None);
+    }
+
+    #[test]
+    fn test_civil_from_days_known_dates() {
+        assert_eq!(civil_from_days(0), (1970, 1)); // epoch
+        assert_eq!(civil_from_days(59), (1970, 3)); // 1970-03-01
+        assert_eq!(civil_from_days(20_454), (2026, 1)); // 2026-01-01
+    }
+
+    #[test]
     fn test_weighted_score_composition() {
         let components = ScoreComponents {
             quality: 80.0,
@@ -2065,6 +2367,268 @@ mod tests {
         assert_eq!(capped.effective_context_length, 4096);
         assert!(capped.memory_required_gb < baseline.memory_required_gb);
         assert!(capped.notes.iter().any(|n| n.contains("Context capped at")));
+    }
+
+    // ── Estimate calibration against measured community benchmarks ──────
+
+    /// Build simulated SystemSpecs for a leaderboard hardware preset label
+    /// like "RTX 3090 (24 GB)" or "Apple M4 Max (128 GB)". Returns None for
+    /// presets the calibration can't model faithfully (e.g. "CPU Only",
+    /// where the CPU model — and thus memory bandwidth — is unknown).
+    fn specs_for_preset_label(label: &str) -> Option<SystemSpecs> {
+        let (name, rest) = label.split_once(" (")?;
+        let vram_gb: f64 = rest
+            .trim_end_matches(')')
+            .trim_end_matches(" GB")
+            .trim()
+            .parse()
+            .ok()?;
+        if name == "CPU Only" {
+            return None;
+        }
+        let unified = name.starts_with("Apple");
+        let backend = if unified {
+            GpuBackend::Metal
+        } else if name.starts_with("RX ") || name.contains("Radeon") {
+            GpuBackend::Rocm
+        } else {
+            GpuBackend::Cuda
+        };
+        // The estimator is bandwidth-driven: without a bandwidth entry for
+        // this GPU the replay would exercise the generic fallback and tell
+        // us nothing about the preset.
+        crate::hardware::gpu_memory_bandwidth_gbps(name)?;
+        let total_ram_gb = if unified {
+            vram_gb
+        } else {
+            (2.0 * vram_gb).max(32.0)
+        };
+        Some(SystemSpecs {
+            total_ram_gb,
+            available_ram_gb: total_ram_gb * 0.85,
+            total_cpu_cores: 16,
+            cpu_name: "calibration".to_string(),
+            has_gpu: true,
+            gpu_vram_gb: Some(vram_gb),
+            total_gpu_vram_gb: Some(vram_gb),
+            gpu_name: Some(name.to_string()),
+            gpu_count: 1,
+            unified_memory: unified,
+            backend,
+            gpus: vec![crate::hardware::GpuInfo {
+                name: name.to_string(),
+                vram_gb: Some(vram_gb),
+                backend,
+                count: 1,
+                unified_memory: unified,
+            }],
+            cluster_mode: false,
+            cluster_node_count: 0,
+        })
+    }
+
+    /// Replay every usable measurement in the embedded localmaxxing cache
+    /// through estimate_tps and check the estimator's overall accuracy.
+    ///
+    /// This is the estimate↔reality feedback loop (#112/#119): the cache is
+    /// refreshed weekly, so a drift in either the estimator or the real
+    /// world shows up here. The bounds are deliberately generous — the test
+    /// exists to catch egregious regressions (e.g. a 3× systematic bias like
+    /// #449), not to enforce per-row precision.
+    #[test]
+    fn test_estimate_tps_calibration_against_leaderboard() {
+        let db = crate::models::ModelDatabase::embedded();
+        let models = db.get_all_models();
+        let config = CalcConfig::default();
+
+        // (preset label, est/measured ratio)
+        let mut ratios: Vec<(String, f64)> = Vec::new();
+        let mut skipped_unknown_model = 0usize;
+
+        for label in crate::benchmarks::cached_preset_labels() {
+            let Some(specs) = specs_for_preset_label(label) else {
+                continue;
+            };
+            let Some(resp) = crate::benchmarks::cached_leaderboard_for_preset(label) else {
+                continue;
+            };
+            for row in &resp.rows {
+                let Some(measured) = row.tok_s_out.filter(|t| *t > 0.5) else {
+                    continue;
+                };
+                // Single-request generation throughput only: batched serving
+                // measures a different quantity than estimate_tps models.
+                if row.batch_size.unwrap_or(1) > 1 {
+                    continue;
+                }
+                // Draft-accelerated runs (speculative decoding / MTP) exceed
+                // the memory-bandwidth roofline plain autoregressive
+                // estimates model — e.g. 577 tok/s for a 9B on an 800 GB/s
+                // card. Comparing against them reads as a 3-4× estimator
+                // "bias" that isn't one.
+                if row.engine_flags.as_ref().is_some_and(|f| {
+                    f.spec_decoding.unwrap_or(false) || f.mtp_enabled.unwrap_or(false)
+                }) {
+                    continue;
+                }
+                let hf_id = row.hf_id();
+                if hf_id.is_empty() {
+                    continue;
+                }
+                let slug = crate::models::canonical_slug(hf_id);
+                let Some(model) = models
+                    .iter()
+                    .find(|m| crate::models::canonical_slug(&m.name) == slug)
+                else {
+                    skipped_unknown_model += 1;
+                    continue;
+                };
+                let quant = {
+                    let q = row.quantization();
+                    if q.is_empty() {
+                        model.quantization.clone()
+                    } else {
+                        q.to_string()
+                    }
+                };
+                let engine = row.engine_name().to_lowercase();
+                let runtime = if engine.contains("mlx") {
+                    InferenceRuntime::Mlx
+                } else if engine.contains("vllm") {
+                    InferenceRuntime::Vllm
+                } else {
+                    InferenceRuntime::LlamaCpp
+                };
+                // Pure-GPU rows only: offload splits depend on unknown
+                // per-run layer placement, so estimates aren't comparable.
+                let ctx = row
+                    .context_length
+                    .unwrap_or(4096)
+                    .min(DEFAULT_ESTIMATION_CTX);
+                let mem = model.estimate_memory_gb(&quant, ctx);
+                let fits_gpu =
+                    specs.unified_memory || specs.gpu_vram_gb.map(|v| mem <= v).unwrap_or(false);
+                if !fits_gpu {
+                    continue;
+                }
+                let est = estimate_tps(model, &quant, &specs, RunMode::Gpu, runtime, &config);
+                if est <= 0.0 {
+                    continue;
+                }
+                ratios.push((label.to_string(), est / measured));
+            }
+        }
+
+        assert!(
+            ratios.len() >= 15,
+            "calibration needs a workable sample; got {} rows \
+             ({skipped_unknown_model} skipped as not in catalog) — did the \
+             cache or catalog shrink drastically?",
+            ratios.len()
+        );
+
+        let mut sorted: Vec<f64> = ratios.iter().map(|(_, r)| *r).collect();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let pct = |p: f64| sorted[((sorted.len() - 1) as f64 * p) as usize];
+        let (p10, median, p90) = (pct(0.10), pct(0.50), pct(0.90));
+
+        // Per-preset medians for the report.
+        let mut by_preset: std::collections::BTreeMap<String, Vec<f64>> = Default::default();
+        for (label, r) in &ratios {
+            by_preset.entry(label.clone()).or_default().push(*r);
+        }
+        println!(
+            "calibration: {} rows across {} presets ({} rows skipped: model not in catalog)",
+            ratios.len(),
+            by_preset.len(),
+            skipped_unknown_model
+        );
+        println!("  est/measured overall: p10={p10:.2} median={median:.2} p90={p90:.2}");
+        for (label, mut rs) in by_preset {
+            rs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            println!(
+                "  {label}: n={} median={:.2}",
+                rs.len(),
+                rs[(rs.len() - 1) / 2]
+            );
+        }
+
+        // Guardrails: a median outside this band means a systematic bias
+        // approaching the #449 bug — investigate before loosening. Baseline
+        // when set (2026-07, 152 rows): median 0.87, per-preset 0.67–1.19.
+        assert!(
+            (0.5..=2.0).contains(&median),
+            "estimate_tps median est/measured ratio {median:.2} is outside \
+             [0.5, 2.0] — systematic estimator bias against {} measured runs",
+            ratios.len()
+        );
+    }
+
+    // ── Usable context (issue #621) ─────────────────────────────────────
+
+    #[test]
+    fn test_usable_context_constrained_by_tight_pool() {
+        // 7B model on a 10 GB card: weights leave a few GB for KV cache, so
+        // the usable context must land strictly below a 200k native window.
+        let mut model = test_model("7B", 4.0, Some(4.0));
+        model.context_length = 200_000;
+        let system = test_system(32.0, true, Some(10.0));
+
+        let fit = ModelFit::analyze(&model, &system);
+        assert!(
+            fit.usable_context < model.context_length,
+            "usable {} should be below native {}",
+            fit.usable_context,
+            model.context_length
+        );
+        assert!(fit.usable_context > 0);
+        assert!(
+            fit.context_display().contains('\u{2192}'),
+            "{}",
+            fit.context_display()
+        );
+    }
+
+    #[test]
+    fn test_usable_context_uncapped_when_pool_is_ample() {
+        // Small window + huge pool: the full native window fits.
+        let mut model = test_model("7B", 4.0, Some(4.0));
+        model.context_length = 8192;
+        let system = test_system(128.0, true, Some(80.0));
+
+        let fit = ModelFit::analyze(&model, &system);
+        assert_eq!(fit.usable_context, 8192);
+        assert_eq!(fit.context_display(), "8k");
+        assert!(!fit.context_severely_limited());
+    }
+
+    #[test]
+    fn test_ctx_sort_uses_usable_context() {
+        // Big-window model that can't use it vs small-window model that can:
+        // on a tight system the honest ranking puts the achievable context
+        // first when sorting by Ctx.
+        let mut big_window = test_model("13B", 8.0, Some(8.0));
+        big_window.context_length = 262_144;
+        big_window.name = "big-window".into();
+        let mut small_window = test_model("1B", 1.0, Some(1.0));
+        small_window.context_length = 32_768;
+        small_window.name = "small-window".into();
+        let system = test_system(16.0, true, Some(10.0));
+
+        let fits = rank_models_by_fit_opts_col(
+            vec![
+                ModelFit::analyze(&big_window, &system),
+                ModelFit::analyze(&small_window, &system),
+            ],
+            false,
+            SortColumn::Ctx,
+        );
+        assert!(
+            fits[0].usable_context >= fits[1].usable_context,
+            "sorted by usable: {} then {}",
+            fits[0].usable_context,
+            fits[1].usable_context
+        );
     }
 
     #[test]
@@ -2395,6 +2959,16 @@ mod tests {
     }
 
     #[test]
+    fn test_tts_backend_incompatible_until_runtime_supported() {
+        let mut model = test_model("82M", 1.0, Some(0.5));
+        model.format = models::ModelFormat::Safetensors;
+        model.capabilities = vec![models::Capability::Audio, models::Capability::Tts];
+
+        let cuda_sys = test_system(64.0, true, Some(24.0));
+        assert!(!backend_compatible(&model, &cuda_sys));
+    }
+
+    #[test]
     fn test_awq_incompatible_on_volta_v100() {
         // V100 is Volta (cc 7.0) — AWQ requires cc >= 7.5
         let mut model = test_model("7B", 4.0, Some(4.0));
@@ -2493,6 +3067,7 @@ mod tests {
             release_date: None,
             gguf_sources: vec![],
             capabilities: vec![],
+            languages: vec![],
             format: models::ModelFormat::default(),
             num_attention_heads: None,
             num_key_value_heads: None,
@@ -2778,6 +3353,7 @@ mod tests {
             release_date: None,
             gguf_sources: vec![],
             capabilities: vec![],
+            languages: vec![],
             format: models::ModelFormat::default(),
             num_attention_heads: None,
             num_key_value_heads: None,
@@ -3061,6 +3637,7 @@ mod tests {
             release_date: None,
             gguf_sources: vec![],
             capabilities: vec![],
+            languages: vec![],
             format: models::ModelFormat::default(),
             num_attention_heads: Some(num_attention_heads),
             num_key_value_heads: Some(num_key_value_heads),
